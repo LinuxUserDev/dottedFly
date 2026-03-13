@@ -446,53 +446,23 @@
       } catch(e){ return null; }
     }
 
-    // Piped public API instances — designed for CORS, returns audio via Piped's own proxy
-    // (not googlevideo.com), so school filters won't block the stream
-    const PIPED_INSTANCES = [
-      'https://pipedapi.kavin.rocks',
-      'https://api.piped.projectsegfau.lt',
-      'https://pipedapi.tokhmi.xyz',
-      'https://pipedapi.moomoo.me',
-      'https://piped-api.garudalinux.org',
-      'https://pa.il.ax',
-    ];
-
     async function invidiousGetAudioUrl(youtubeUrl){
       const videoId = extractYoutubeId(youtubeUrl);
       if(!videoId){ console.warn('[BlockedMode] Could not extract video ID from:', youtubeUrl); return null; }
 
-      // corsproxy.io adds Access-Control-Allow-Origin header to any request
-      // Piped returns 200 with valid data but no CORS header — proxy fixes that
-      const CORS_WRAP = url => 'https://corsproxy.io/?' + encodeURIComponent(url);
-
-      for(const instance of PIPED_INSTANCES){
-        try {
-          const apiUrl = instance + '/streams/' + videoId;
-          const proxied = CORS_WRAP(apiUrl);
-          console.log('[BlockedMode] Trying:', proxied);
-          const res = await fetch(proxied, {
-            headers: { 'Accept': 'application/json' },
-            signal: AbortSignal.timeout(12000)
-          });
-          if(!res.ok){ console.warn('[BlockedMode]', instance, 'returned HTTP', res.status); continue; }
-          const data = await res.json();
-
-          // Pick highest quality audio-only stream
-          const streams = (data.audioStreams || [])
-            .filter(s => !s.videoOnly)
-            .sort((a, b) => (parseInt(b.bitrate)||0) - (parseInt(a.bitrate)||0));
-
-          if(streams.length > 0){
-            const best = streams[0];
-            console.log('[BlockedMode] Got stream from', instance, '— quality:', best.quality, 'codec:', best.codec);
-            return best.url;
-          }
-          console.warn('[BlockedMode]', instance, '— no audioStreams in response:', JSON.stringify(data).slice(0,200));
-        } catch(e){
-          console.warn('[BlockedMode]', instance, 'failed:', e.message);
-        }
+      // /proxy is served by worker.js on the same domain — no CORS issues
+      try {
+        const reqUrl = '/proxy?id=' + videoId;
+        console.log('[BlockedMode] Calling proxy:', reqUrl);
+        const res = await fetch(reqUrl, { signal: AbortSignal.timeout(15000) });
+        const data = await res.json();
+        if(!res.ok || data.error){ console.warn('[BlockedMode] Proxy error:', data.error); return null; }
+        console.log('[BlockedMode] Got audio — quality:', data.quality, 'codec:', data.codec, 'via:', data.instance);
+        return data.url;
+      } catch(e){
+        console.warn('[BlockedMode] Proxy call failed:', e.message);
+        return null;
       }
-      return null;
     }
     // ─────────────────────────────────────────────────────────────────────────
 
