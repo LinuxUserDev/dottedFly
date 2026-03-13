@@ -8,9 +8,10 @@
     const SUPABASE_URL = 'https://hwglnarnkyeztvrjbxaf.supabase.co';
     const SUPABASE_KEY = 'sb_publishable_cEATRRrdHDUg6agBVektnw_ARKG8vQl';
 
+    // With new sb_publishable_ keys, Authorization must exactly match apikey (no "Bearer" prefix)
     const _sbHeaders = {
       'apikey': SUPABASE_KEY,
-      'Authorization': `Bearer ${SUPABASE_KEY}`,
+      'Authorization': SUPABASE_KEY,
       'Content-Type': 'application/json',
     };
 
@@ -47,7 +48,12 @@
               headers: { ..._sbHeaders, Prefer: 'return=representation' },
               body: JSON.stringify(data),
             });
-            if (!res.ok) { console.warn('create failed', res.status, await res.text()); return data; }
+            if (!res.ok) {
+              const err = await res.text();
+              console.error('Supabase create failed', res.status, err);
+              alert(`Save failed (${res.status}): ${err}\n\nMake sure you ran the SQL to create the tables in Supabase.`);
+              return data;
+            }
             const rows = await res.json();
             const rec = Array.isArray(rows) ? rows[0] : rows;
             _cache[tableName] = [..._cache[tableName], rec];
