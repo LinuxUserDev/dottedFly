@@ -17,6 +17,28 @@
     // Each collection keeps a local cache so getList() can remain synchronous.
     const _cache = {};
 
+    // ── Startup connection test ───────────────────────────────────────────────
+    (async () => {
+      try {
+        const res = await fetch(`${SUPABASE_URL}/rest/v1/dottedfly_playlist_v1?limit=1`, { headers: _sbHeaders });
+        const body = await res.text();
+        if (!res.ok) {
+          document.getElementById('app').innerHTML = `
+            <div style="max-width:600px;margin:40px auto;background:#1a0000;padding:20px;border-radius:12px;color:#ff9999;font-family:monospace">
+              <b>⚠️ Supabase error (HTTP ${res.status})</b><br><br>
+              <pre style="white-space:pre-wrap;word-break:break-all">${body}</pre>
+              <br><small style="color:#888">Make sure you ran the SQL setup script in Supabase SQL Editor.</small>
+            </div>`;
+        }
+      } catch(e) {
+        document.getElementById('app').innerHTML = `
+          <div style="max-width:600px;margin:40px auto;background:#1a0000;padding:20px;border-radius:12px;color:#ff9999;font-family:monospace">
+            <b>⚠️ Cannot reach Supabase</b><br><br>${e.message}
+          </div>`;
+      }
+    })();
+    // ─────────────────────────────────────────────────────────────────────────
+
     async function sbFetch(table, qs = '') {
       const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}?order=created_at${qs}`, { headers: _sbHeaders });
       if (!res.ok) { console.warn('Supabase fetch error', res.status, await res.text()); return []; }
@@ -47,13 +69,14 @@
               headers: { ..._sbHeaders, Prefer: 'return=representation' },
               body: JSON.stringify(data),
             });
+            const bodyText = await res.text();
             if (!res.ok) {
-              const err = await res.text();
-              console.error('Supabase create failed', res.status, err);
-              alert(`Save failed (${res.status}): ${err}\n\nMake sure you ran the SQL to create the tables in Supabase.`);
+              console.error('Supabase create failed', res.status, bodyText);
+              alert(`❌ Supabase error ${res.status} on table "${tableName}":\n\n${bodyText}\n\nCheck browser console for details.`);
               return data;
             }
-            const rows = await res.json();
+            let rows;
+            try { rows = JSON.parse(bodyText); } catch(e) { rows = [data]; }
             const rec = Array.isArray(rows) ? rows[0] : rows;
             _cache[tableName] = [..._cache[tableName], rec];
             return rec;
