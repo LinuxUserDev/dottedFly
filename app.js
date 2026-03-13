@@ -273,7 +273,7 @@
     const playlistsCol = room.collection('dottedfly_playlist_v1');
     const tracksCol = room.collection('dottedfly_track_v1');
 
-    const state = { playlists: [], currentPlaylistId: null, tracks: [], playingId: null, audioEl: null, progress:0, duration:0, isPlaying:false };
+    const state = { playlists: [], currentPlaylistId: null, tracks: [], playingId: null, audioEl: null, progress:0, duration:0, isPlaying:false, blockedLoading:false };
 
     async function syncPlaylists(){
       // refresh cache from Supabase, then filter
@@ -427,27 +427,99 @@
       state.playingId = null; state.isPlaying=false; state.progress=0; state.duration=0;
       render();
     }
+    // ── Blocked Mode (Chromebook YouTube bypass) ──────────────────────────────
+    // Uses cobalt.tools to fetch a direct audio stream URL for YouTube links.
+    // Plays via HTML5 Audio so progress bar and pause work properly.
+    const LS_BLOCKED = 'dottedfly_blocked_mode_v1';
+    let blockedMode = localStorage.getItem(LS_BLOCKED) === '1';
 
-    function playTrack(track){
+    function setBlockedMode(val){
+      blockedMode = val;
+      localStorage.setItem(LS_BLOCKED, val ? '1' : '0');
+      const btn = document.getElementById('blockedModeBtn');
+      if(btn) styleBlockedBtn(btn, val);
+    }
+
+    function styleBlockedBtn(btn, active){
+      btn.textContent = active ? '🔒 Blocked Mode: ON' : '🔓 Blocked Mode: OFF';
+      btn.style.background = active ? '#ff6b6b' : 'transparent';
+      btn.style.color = active ? '#111' : 'var(--muted)';
+      btn.style.border = active ? 'none' : '1px solid rgba(255,255,255,0.08)';
+    }
+
+    async function cobaltGetAudioUrl(youtubeUrl){
+      // cobalt.tools free public API — no key needed
+      try {
+        const res = await fetch('https://api.cobalt.tools/', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+          body: JSON.stringify({ url: youtubeUrl, downloadMode: 'audio', audioFormat: 'mp3', filenameStyle: 'basic' }),
+        });
+        if(!res.ok){ console.warn('cobalt error', res.status, await res.text()); return null; }
+        const data = await res.json();
+        console.log('[BlockedMode] cobalt response:', data);
+        // cobalt returns { status: "stream"|"redirect"|"tunnel"|"picker", url: "..." }
+        if(data.url) return data.url;
+        if(data.status === 'picker' && data.picker?.[0]?.url) return data.picker[0].url;
+        return null;
+      } catch(e){ console.warn('cobalt fetch failed:', e); return null; }
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
+
+    function attachAudio(url, trackId){
+      const audio = new Audio(url);
+      audio.preload = 'metadata';
+      audio.crossOrigin = 'anonymous';
+      audio.addEventListener('timeupdate', ()=>{ state.progress = audio.currentTime; state.duration = audio.duration || 0; render(); });
+      audio.addEventListener('play', ()=>{ state.isPlaying=true; render(); });
+      audio.addEventListener('pause', ()=>{ state.isPlaying=false; render(); });
+      audio.addEventListener('ended', ()=>{ state.isPlaying=false; nextTrack(); render(); });
+      document.body.appendChild(audio);
+      state.audioEl = audio;
+      state.playingId = trackId;
+      audio.play().catch(e => console.warn('audio play failed:', e));
+      render();
+    }
+
+    async function playTrack(track){
+      // Toggle pause/play if same track
       if(state.audioEl && state.playingId===track.id){
         if(state.isPlaying) state.audioEl.pause(); else state.audioEl.play();
         return;
       }
+      // Stop current audio
       if(state.audioEl){
         state.audioEl.pause(); state.audioEl.src=''; state.audioEl.remove(); state.audioEl=null;
       }
-      if(track.kind==='audio' || /\.(mp3|ogg|wav)$/i.test(track.url||'')){
-        const audio = new Audio(track.url);
-        audio.preload='metadata';
-        audio.addEventListener('timeupdate', ()=>{ state.progress = audio.currentTime; state.duration = audio.duration || 0; render(); });
-        audio.addEventListener('play', ()=>{ state.isPlaying=true; render(); });
-        audio.addEventListener('pause', ()=>{ state.isPlaying=false; render(); });
-        audio.addEventListener('ended', ()=>{ state.isPlaying=false; nextTrack(); render(); });
-        document.body.appendChild(audio);
-        state.audioEl = audio; state.playingId = track.id; audio.play().catch(()=>{});
+
+      const isYoutube = track.kind==='youtube' || detectKind(track.source||track.url||'') === 'youtube';
+
+      // Blocked mode: use cobalt.tools to get a direct audio stream for YouTube
+      if(blockedMode && isYoutube){
+        state.playingId = track.id;
+        state.isPlaying = false;
+        state.blockedLoading = true;
         render();
+        const audioUrl = await cobaltGetAudioUrl(track.source || track.url);
+        state.blockedLoading = false;
+        if(!audioUrl){
+          alert('Blocked Mode: Could not fetch audio for this track.\nCobalt.tools may be unavailable or the video is restricted.');
+          state.playingId = null;
+          render();
+          return;
+        }
+        attachAudio(audioUrl, track.id);
         return;
       }
+
+      // Normal audio file (mp3/ogg/wav or uploaded)
+      if(track.kind==='audio' || /\.(mp3|ogg|wav)$/i.test(track.url||'')){
+        attachAudio(track.url, track.id);
+        return;
+      }
+
+      // Fallback: embed mode (YouTube iframe etc.)
       state.playingId = track.id; state.isPlaying = true; render();
     }
 
@@ -557,6 +629,13 @@
     function render(){
       const root = document.getElementById('app');
       root.innerHTML = '';
+    // Inject pulse animation for loading indicator
+    if(!document.getElementById('df-style')){
+      const st = document.createElement('style');
+      st.id = 'df-style';
+      st.textContent = '@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}';
+      document.head.appendChild(st);
+    }
 
       // If no authenticated user/session, show only a minimal auth prompt UI
       if(!currentUser || !currentUser.username){
@@ -657,6 +736,10 @@
           <button id="refreshBtn" class="btn ghost small">Refresh</button>
           <button id="shuffleBtn" class="btn ghost small">Randomize</button>
         </div>
+        <div style="margin-top:4px">
+          <button id="blockedModeBtn" class="btn ghost small" style="width:100%;text-align:left;padding:8px 12px;border-radius:8px;font-size:12px;transition:all 0.2s"></button>
+        </div>
+        ${ state.blockedLoading ? `<div style="font-size:12px;color:var(--muted);padding:4px 2px;animation:pulse 1s infinite">⏳ Fetching audio via cobalt.tools…</div>` : '' }
         <div class="track-list" id="trackList"></div>
         <div class="footer">
           <div class="small-muted">Signed in as ${currentUser ? currentUser.username : 'guest'}</div>
@@ -834,6 +917,8 @@
       document.getElementById('addUrlBtn').onclick = async ()=>{ const v = document.getElementById('urlInput').value.trim(); if(v){ await addByUrl(v); document.getElementById('urlInput').value=''; } };
       document.getElementById('file').onchange = async (e)=>{ const f = e.target.files[0]; if(f){ await uploadFile(f); e.target.value=''; } };
       document.getElementById('refreshBtn').onclick = ()=> { syncPlaylists(); syncTracks(); };
+      const _bmBtn = document.getElementById('blockedModeBtn');
+      if(_bmBtn){ styleBlockedBtn(_bmBtn, blockedMode); _bmBtn.onclick = ()=> setBlockedMode(!blockedMode); }
       document.getElementById('stopBtn').onclick = ()=> stopPlayback();
       document.getElementById('clearMine').onclick = ()=> {
         if(confirm('Clear all tracks you created?')){
