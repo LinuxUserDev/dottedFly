@@ -438,17 +438,6 @@
       localStorage.setItem(LS_BLOCKED, val ? '1' : '0');
     }
 
-    // Multiple Invidious instances as fallbacks — tries each until one works.
-    // Invidious returns real googlevideo.com CDN URLs which bypass YouTube blocks.
-    const INVIDIOUS_INSTANCES = [
-      'https://inv.tux.pizza',
-      'https://invidious.fdn.fr',
-      'https://iv.ggtyler.dev',
-      'https://invidious.privacydev.net',
-      'https://yt.cdaut.de',
-      'https://invidious.nerdvpn.de',
-    ];
-
     function extractYoutubeId(url){
       try {
         if(url.includes('youtu.be/')) return url.split('youtu.be/')[1].split(/[?&]/)[0];
@@ -457,46 +446,45 @@
       } catch(e){ return null; }
     }
 
-    // CORS proxies to wrap Invidious API calls — browser same-origin policy blocks direct fetch
-    const CORS_PROXIES = [
-      url => 'https://corsproxy.io/?' + encodeURIComponent(url),
-      url => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(url),
+    // Piped public API instances — designed for CORS, returns audio via Piped's own proxy
+    // (not googlevideo.com), so school filters won't block the stream
+    const PIPED_INSTANCES = [
+      'https://pipedapi.kavin.rocks',
+      'https://api.piped.projectsegfau.lt',
+      'https://pipedapi.tokhmi.xyz',
+      'https://pipedapi.moomoo.me',
+      'https://piped-api.garudalinux.org',
+      'https://pa.il.ax',
     ];
 
     async function invidiousGetAudioUrl(youtubeUrl){
       const videoId = extractYoutubeId(youtubeUrl);
       if(!videoId){ console.warn('[BlockedMode] Could not extract video ID from:', youtubeUrl); return null; }
 
-      for(const instance of INVIDIOUS_INSTANCES){
-        for(const proxy of CORS_PROXIES){
-          try {
-            const apiUrl = instance + '/api/v1/videos/' + videoId + '?fields=adaptiveFormats,formatStreams';
-            const proxied = proxy(apiUrl);
-            console.log('[BlockedMode] Trying:', proxied);
-            const res = await fetch(proxied, { signal: AbortSignal.timeout(10000) });
-            if(!res.ok){ console.warn('[BlockedMode] Got', res.status, 'from proxy'); continue; }
-            const data = await res.json();
+      for(const instance of PIPED_INSTANCES){
+        try {
+          const apiUrl = instance + '/streams/' + videoId;
+          console.log('[BlockedMode] Trying Piped instance:', apiUrl);
+          const res = await fetch(apiUrl, {
+            headers: { 'Accept': 'application/json' },
+            signal: AbortSignal.timeout(10000)
+          });
+          if(!res.ok){ console.warn('[BlockedMode]', instance, 'returned HTTP', res.status); continue; }
+          const data = await res.json();
 
-            // audio-only adaptive streams — highest bitrate first
-            const audioFormats = (data.adaptiveFormats || [])
-              .filter(f => f.type && f.type.startsWith('audio/'))
-              .sort((a, b) => (parseInt(b.bitrate)||0) - (parseInt(a.bitrate)||0));
+          // Pick highest quality audio-only stream
+          const streams = (data.audioStreams || [])
+            .filter(s => !s.videoOnly)
+            .sort((a, b) => (parseInt(b.bitrate)||0) - (parseInt(a.bitrate)||0));
 
-            if(audioFormats.length > 0){
-              const best = audioFormats[0];
-              console.log('[BlockedMode] Success! type:', best.type, 'bitrate:', best.bitrate);
-              return best.url;
-            }
-
-            // fallback: combined stream (has video+audio)
-            const streams = data.formatStreams || [];
-            if(streams.length > 0){
-              console.log('[BlockedMode] Using combined stream fallback');
-              return streams[0].url;
-            }
-          } catch(e){
-            console.warn('[BlockedMode]', instance, 'via proxy failed:', e.message);
+          if(streams.length > 0){
+            const best = streams[0];
+            console.log('[BlockedMode] Got stream from', instance, '— quality:', best.quality, 'codec:', best.codec, 'url:', best.url.slice(0, 80)+'...');
+            return best.url;
           }
+          console.warn('[BlockedMode]', instance, '— no audioStreams in response');
+        } catch(e){
+          console.warn('[BlockedMode]', instance, 'failed:', e.message);
         }
       }
       return null;
