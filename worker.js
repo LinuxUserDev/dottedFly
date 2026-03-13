@@ -1,18 +1,6 @@
 // DottedFly worker.js
-// Calls YouTube's internal /youtubei/v1/player API directly (same API the YouTube app uses).
-// Returns a direct audio stream URL. No third-party services involved.
-
-const YT_API_URL = 'https://www.youtube.com/youtubei/v1/player?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8&prettyPrint=false';
-
-// Android client context — returns direct, non-encrypted stream URLs
-const YT_CLIENT = {
-  clientName: 'ANDROID',
-  clientVersion: '19.09.37',
-  androidSdkVersion: 30,
-  userAgent: 'com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip',
-  hl: 'en',
-  gl: 'US',
-};
+// Tries multiple YouTube internal clients in order until one returns direct audio URLs.
+// android_vr and TVHTML5_SIMPLY don't require PO tokens (as of early 2026).
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -20,8 +8,133 @@ const CORS = {
   'Content-Type': 'application/json',
 };
 
+const YT_PLAYER_URL = 'https://www.youtube.com/youtubei/v1/player?prettyPrint=false';
+
+// Clients tried in order — first one to return direct (non-cipher) audio URLs wins
+const CLIENTS = [
+  {
+    // Android VR — yt-dlp's current default, returns direct URLs, no PO token needed
+    name: 'ANDROID_VR',
+    context: {
+      client: {
+        clientName: 'ANDROID_VR',
+        clientVersion: '1.60.19',
+        androidSdkVersion: 32,
+        osName: 'Android',
+        osVersion: '12',
+        platform: 'MOBILE',
+        hl: 'en',
+        gl: 'US',
+      },
+    },
+    headers: {
+      'User-Agent': 'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12; Build/SQ3A.220705.002) gzip',
+      'X-YouTube-Client-Name': '28',
+      'X-YouTube-Client-Version': '1.60.19',
+    },
+  },
+  {
+    // TV Simply — lightweight client, no PO token, direct URLs
+    name: 'TVHTML5_SIMPLY',
+    context: {
+      client: {
+        clientName: 'TVHTML5_SIMPLY',
+        clientVersion: '2.0',
+        hl: 'en',
+        gl: 'US',
+      },
+    },
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (SMART-TV; Linux; Tizen 6.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/6.0 TV Safari/538.1',
+      'X-YouTube-Client-Name': '85',
+      'X-YouTube-Client-Version': '2.0',
+    },
+  },
+  {
+    // iOS — fallback, sometimes works without PO token
+    name: 'IOS',
+    context: {
+      client: {
+        clientName: 'IOS',
+        clientVersion: '20.03.02',
+        deviceMake: 'Apple',
+        deviceModel: 'iPhone16,2',
+        osName: 'iPhone',
+        osVersion: '18.2.1.22C161',
+        hl: 'en',
+        gl: 'US',
+      },
+    },
+    headers: {
+      'User-Agent': 'com.google.ios.youtube/20.03.02 (iPhone16,2; U; CPU iPhone OS 18_2_1 like Mac OS X)',
+      'X-YouTube-Client-Name': '5',
+      'X-YouTube-Client-Version': '20.03.02',
+    },
+  },
+];
+
 function jsonResponse(data, status = 200) {
   return new Response(JSON.stringify(data), { status, headers: CORS });
+}
+
+async function fetchPlayer(videoId, client) {
+  const body = {
+    videoId,
+    context: client.context,
+    contentCheckOk: true,
+    racyCheckOk: true,
+  };
+
+  const res = await fetch(YT_PLAYER_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+      'Origin': 'https://www.youtube.com',
+      'Referer': 'https://www.youtube.com/',
+      ...client.headers,
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) return { error: `HTTP ${res.status}` };
+
+  const data = await res.json();
+
+  const playStatus = data?.playabilityStatus?.status;
+  if (playStatus && playStatus !== 'OK') {
+    return { error: `Not playable: ${data?.playabilityStatus?.reason || playStatus}` };
+  }
+
+  // Pick audio-only adaptive formats with direct URL (no signatureCipher)
+  const adaptive = (data?.streamingData?.adaptiveFormats || [])
+    .filter(f => f.mimeType?.startsWith('audio/') && f.url && !f.signatureCipher)
+    .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+
+  if (adaptive.length > 0) {
+    return {
+      url: adaptive[0].url,
+      quality: adaptive[0].audioQuality,
+      codec: adaptive[0].mimeType,
+      client: client.name,
+    };
+  }
+
+  // Fallback: combined formats (video+audio)
+  const combined = (data?.streamingData?.formats || [])
+    .filter(f => f.url && !f.signatureCipher)
+    .sort((a, b) => (a.bitrate || 0) - (b.bitrate || 0));
+
+  if (combined.length > 0) {
+    return {
+      url: combined[0].url,
+      quality: combined[0].qualityLabel || 'combined',
+      codec: combined[0].mimeType,
+      client: client.name,
+    };
+  }
+
+  return { error: 'No direct URL formats found (all cipher-protected)' };
 }
 
 export default {
@@ -32,7 +145,6 @@ export default {
       return new Response(null, { headers: CORS });
     }
 
-    // Pass all non-proxy requests to static assets
     if (url.pathname !== '/proxy') {
       return env.ASSETS.fetch(request);
     }
@@ -42,67 +154,19 @@ export default {
       return jsonResponse({ error: 'Missing or invalid video id' }, 400);
     }
 
-    try {
-      const body = {
-        videoId,
-        context: { client: YT_CLIENT },
-        contentCheckOk: true,
-        racyCheckOk: true,
-      };
-
-      const res = await fetch(YT_API_URL, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'User-Agent': YT_CLIENT.userAgent,
-          'X-YouTube-Client-Name': '3',
-          'X-YouTube-Client-Version': YT_CLIENT.clientVersion,
-          'Origin': 'https://www.youtube.com',
-        },
-        body: JSON.stringify(body),
-      });
-
-      if (!res.ok) {
-        return jsonResponse({ error: `YouTube API returned ${res.status}` }, 502);
-      }
-
-      const data = await res.json();
-
-      const status = data?.playabilityStatus?.status;
-      if (status && status !== 'OK') {
-        const reason = data?.playabilityStatus?.reason || status;
-        return jsonResponse({ error: `Video not playable: ${reason}` }, 403);
-      }
-
-      const formats = data?.streamingData?.adaptiveFormats || [];
-
-      // Audio-only streams, highest bitrate first
-      const audioFormats = formats
-        .filter(f => f.mimeType && f.mimeType.startsWith('audio/') && f.url)
-        .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-
-      if (audioFormats.length === 0) {
-        // Fallback to combined video+audio formats
-        const combined = (data?.streamingData?.formats || [])
-          .filter(f => f.url)
-          .sort((a, b) => (a.bitrate || 0) - (b.bitrate || 0));
-        if (combined.length > 0) {
-          const f = combined[0];
-          return jsonResponse({ url: f.url, quality: f.qualityLabel || 'combined', codec: f.mimeType });
+    const errors = [];
+    for (const client of CLIENTS) {
+      try {
+        const result = await fetchPlayer(videoId, client);
+        if (result.url) {
+          return jsonResponse(result);
         }
-        return jsonResponse({ error: 'No playable audio streams found' }, 502);
+        errors.push(`${client.name}: ${result.error}`);
+      } catch (e) {
+        errors.push(`${client.name}: ${e.message}`);
       }
-
-      const best = audioFormats[0];
-      return jsonResponse({
-        url: best.url,
-        quality: best.audioQuality || 'unknown',
-        codec: best.mimeType,
-        bitrate: best.bitrate,
-      });
-
-    } catch (e) {
-      return jsonResponse({ error: e.message }, 500);
     }
+
+    return jsonResponse({ error: 'All clients failed', details: errors }, 502);
   },
 };
